@@ -7,10 +7,18 @@ Supports:
 - PG tables only with timezone (converts all to UTC for vectorisation)
 - Points only at present
 
+TODOS:
+- Speed up the cluster reduction method:
+    - reduce by time bounds first (do all vecs)
+    - Estimate area from normed vecs and bounding box
+
+- Output more metrics about the clusters - using centroid etc
+
 '''
 
 import numpy as np
 import psycopg2
+import sys
 from sklearn.cluster import KMeans
 from datetime import datetime, timedelta
 import scipy.spatial.distance as dist
@@ -35,7 +43,7 @@ class kmCorrelate(object):
                         "tableName":'testdots3tz', "tsField":'time_stamp', "geomField":'the_geom'}
                        ],
          'maxClustArea':10.0, 'maxClustTime':3600.0,
-         'pgTableOut':{"host":'localhost', "user":'dusted', "db":'dusted', "passwd":'dusted',
+         'pgTableOut':{"host":'localhost', "user":'dusted', "db":'dusted', "passwd":'dusted', "schema":'public',
                        "tableName":'testClass', "tsField":'time_stamp', "geomField":'the_geom'},
          'runType': 'setupcheck'}
         '''
@@ -87,6 +95,11 @@ class kmCorrelate(object):
                 print 'Fatal: PG Input table check failed'
                 raise ValueError
 
+            #check PG Output table privileges
+            if self.testPGOutput(params['pgTableOut']) == False:
+                print 'Fatal: PG Output table check failed'
+                raise ValueError
+
             #If we are just checking setup we've passed init - return
             if params['runType'] == 'setupcheck':
                 print 'Success: Params look good: '+ str(params)
@@ -95,8 +108,11 @@ class kmCorrelate(object):
             elif params['runType'] == 'full':
                 #Now run the algo
                 vects, infoStore = self.vectorise()
-                clustVecs, clustCenters = self.cluster(vects, infoStore)
-                self.reduceClusters(clustVecs, clustCenters)
+                clustLabels, clustVecs, clustCents = self.cluster(vects, infoStore)
+                goodClusts = self.reduceClusters(clustLabels, clustVecs, clustCents,
+                                                 params['pgTableOut'], self.xMin, self.yMin, self.xRange, self.yRange)
+                print goodClusts
+                output = self.saveClusterHulls(goodClusts, clustVecs, clustCents, params['pgtableOut'])
 
                 return None
             else:
@@ -109,7 +125,35 @@ class kmCorrelate(object):
     def testPGOutput(self, pgTableOut):
         '''Checks for privs to create an output table
         '''
-        pass
+        try:
+            user = pgTableOut['user']
+            db = pgTableOut['db']
+            host = pgTableOut['host']
+            passwd = pgTableOut['passwd']
+            schema = pgTableOut['schema']
+        except KeyError as e:
+            err = str(e)
+            print 'Fatal: Missing DB Connection info for Output table: ' + err
+            return False
+        try:
+            pgC = self.pgConn(pgTableOut['host'], pgTableOut['db'],
+                          pgTableOut['user'], pgTableOut['passwd'])
+        except:
+            print 'Fatal: Connection to output table failed: ' + str(pgTableOut)
+            return False
+
+        #Check the Schema Privs for table creation
+        cur = pgC.cursor()
+        sql = 'SELECT * FROM has_schema_privilege(%s, %s, %s)'
+        data = (pgTableOut['user'],pgTableOut['schema'], 'CREATE')
+        cur.execute(sql, data)
+        r = cur.fetchall()
+        if r[0][0] != True:
+            print 'Fatal: User does not have create privileges for output DB: ' + str(pgTableOut)
+            pgC.close()
+            return False
+        else:
+            return True
 
     def testPGInput(self, pgTables):
         '''Tests all the given pg tables for appropriateness for running
@@ -205,6 +249,88 @@ class kmCorrelate(object):
         unNormDtg = datetime.fromtimestamp(((inDtgUnix*totSecs)-dtgFromUnix)*-1)
         return unNormDtg
 
+    def chkDtgRange(self, clustDtgs, dtgFromUnix, dtgToUnix):
+        '''Takes in array of normalised dtg's, finds min - max values and returns range
+        dtgfrom and dtg are date ranges of input data in UTC(secs)
+        '''
+        fromNorm = min(clustDtgs)
+        toNorm = max(clustDtgs)
+        #UnNormalise
+        fromUnNorm = self.unNormDtg(fromNorm, dtgFromUnix, dtgToUnix)
+        toUnNorm = self.unNormDtg(toNorm, dtgFromUnix, dtgToUnix)
+        #Get Range
+        dtgRnge = fromUnNorm - toUnNorm
+        return dtgRnge.total_seconds(), fromUnNorm, toUnNorm
+
+    def geoArea(self, inGeomStr, pgParams):
+        '''Calculates area of input geometry string
+        Uses PostGIS
+        '''
+        #PG Conn
+        try:
+            pgC = self.pgConn(pgParams['host'], pgParams['db'],
+                          pgParams['user'], pgParams['passwd'])
+        except:
+            print 'Fatal: Connection to output table failed: ' + str(pgParams)
+            raise ValueError
+
+        #Build sql (casting to geography) & execute
+        sql = 'SELECT st_area(geography(%s))'
+        data = (inGeomStr,)
+        cur = pgC.cursor()
+        cur.execute(sql, data)
+        res = cur.fetchall()
+        pgC.close()
+        #Result in sq meters
+        return res[0][0]
+
+    def convexHullCluster(self, clusterVecs, pgParams, xMin, yMin, xRange, yRange):
+        '''Creates a convex hull from the input single cluster (np array of vects with cluster idx)
+        Input clusters are normalised on input
+        Outputs a PG Geometry string
+        Uses PostGIS
+        '''
+        polySql = 'SELECT ST_ConvexHull(st_GeomFromText(\'POLYGON(('
+        #un normalise the coords
+        for vec in clusterVecs:
+            geoX, geoY = self.unNormCoords(vec[0], vec[1], xMin, yMin, xRange, yRange)
+            polySql = polySql + str(geoX) +' '+ str(geoY)+','
+
+        #Close the polygon
+        geoX, geoY = self.unNormCoords(clusterVecs[0][0], clusterVecs[0][1], xMin, yMin, xRange, yRange)
+        polySql = polySql+str(geoX)+' '+str(geoY)+'))\',4326))'
+        #PG connection
+        try:
+            pgC = self.pgConn(pgParams['host'], pgParams['db'],
+                          pgParams['user'], pgParams['passwd'])
+        except:
+            print 'Fatal: Connection to output table failed: ' + str(pgParams)
+            raise ValueError
+        cur = pgC.cursor()
+        print cur.mogrify(polySql)
+        cur.execute(polySql)
+        res = cur.fetchall()
+        pgC.close()
+        return res[0][0]
+
+    def saveClusterHulls(self, goodClusts, clusterVecs, pgTableOut):
+        '''Dumps reduced clusters to database as convex hulls
+        Input: good cluster index numbers, zipped cluster vectors
+        Output: True / False on save to DB
+        '''
+        #PG connection
+        try:
+            pgC = self.pgConn(pgTableOut['host'], pgTableOut['db'],
+                          pgTableOut['user'], pgTableOut['passwd'])
+        except:
+            print 'Fatal: Connection to output table failed: ' + str(pgTableOut)
+            raise ValueError
+        #Work through the good clusters, hulling and saving
+        for idx, pt in enumerate(clusterVecs):
+            #Only take the ones we care about
+            if int(pt[0]) in goodClusts:
+                pass
+
     def vectorise(self):
         '''Creates an array of normalised vectors from the input tables
         '''
@@ -280,53 +406,70 @@ class kmCorrelate(object):
         outCenters = kmClust.cluster_centers_
         kmLabels = kmClust.labels_
         #Zip up the cluster labels and vectors
-        zipped = zip(kmLabels, inVecs)
+        #zipped = zip(kmLabels, inVecs)
 
-        return zipped, outCenters
+        return kmLabels, inVecs, outCenters
 
-    def reduceClusters(self, clustVecs, clustCenters):
+    def clusterDists(self, clusterVecs, clustCent):
+        '''Calculates the average distance between centroid and clusters vectors
+        both for spatial distance and whole vector
+        NOT IMPLEMENTED
+        '''
+        d = 0.0
+        dSpat = 0.0
+        #Calc centroid to pt distances
+        for c in clusterVecs:
+            #Whole vector
+            d = d+dist.pdist([c,clustCent])
+            #Geospatial only
+            dSpat = dSpat+dist.pdist([c[0:1],clustCent[0:1]])
+        #Avg it - maybe working
+        avgDist = d/len(clusterVecs)
+        avgSpatDist = dSpat/len(clusterVecs)
+        d = 0.0
+        dSpat = 0.0
+        return avgDist, avgSpatDist
+
+    def reduceClusters(self, clustLabels, clustVecs, clustCents, pgParams, xMin, yMin, xRange, yRange):
         '''Take the KMeans clustering output and picks the clusters for export
+        Output array containing arrays for each good cluster: x,y,z, spatDist, timeDist:
+        [[x,y,z], [x,y,z], ...],spatDist, timeDist]
         '''
         print 'Running: Reducing Clusters...'
         clustPts = []
-        avgs = []
-        avgDict = {}
-        d = 0.0
-        dSpat = 0.0
-        #Work out how good the clusters are
-        for idx, cent in enumerate(clustCenters):
-            #Get the points in this cluster
-            for pt in clustVecs:
-                if pt[0] == idx:
-                    #Its in the class - store
-                    clustPts.append(pt[1])
-            #Now we have a list with all points for this cluster
-            #Calc centroid to pt distances
-            for c in clustPts:
-                #Whole vector
-                d = d+dist.pdist([c,cent])
-                #Geospatial only
-                dSpat = dSpat+dist.pdist([c[0:1],cent[0:1]])
-            #Avg it - maybe working
-            avgDist = d/len(clustPts)
-            avgSpatDist = dSpat/len(clustPts)
-            avgs.append([idx, avgDist])
-            avgDict[idx]=[avgDist, avgSpatDist]
-            d = 0.0
-            dSpat = 0.0
-            clustPts = []
+        clustDtgs = []
+        outClusts = []
+        #Zip lists together
+        vecZip = zip(clustVecs, clustLabels)
+        #Loop through clusters
+        for lbl in clustLabels:
+            #Build Cluster array
+            clustPts = [(vec[0][0], vec[0][1]) for vec in vecZip if vec[1]==lbl]
+            clustDtgs = [vec[0][2] for vec in vecZip if vec[1]==lbl]
+            #Check DTG first - total range in seconds
+            clustSecs, clustDtgfrom, clustDtgTo = self.chkDtgRange(clustDtgs, self.unixDtgFrom, self.unixDtgTo)
+            print 'time:'+str(clustSecs)
+            if clustSecs < params['maxClustTime']:
+                #Calculate area of this cluster
+                geomStr = self.convexHullCluster(clustPts, pgParams, xMin, yMin, xRange, yRange)
+                #Area in Sq Metres
+                geoArea = self.geoArea(geomStr, pgParams)
+                print 'Area:'+str(geoArea)
+                #Check if its within input area tolerance
+                if geoArea <= params['maxClustArea']:
+                    #Good cluster - store
+                    outClusts.append((clustPts, geoArea, clustDtgfrom, clustDtgTo))
+                else:
+                    #Clean up and move on
+                    clustPts = []
+                    clustDtgs = []
+            else:
+                #Clean up and move on
+                clustPts = []
+                clustDtgs = []
 
-        #Sort by cluster distance and pick
-        #Do it the list way
-        goodClusts = []
-        print 'Clusters and dists follow'
-        sAvgs = sorted(avgs, key=lambda clust:clust[1])
-        for i in sAvgs:
-            print i
-            goodClusts.append(i[0])
-        goodClusts = goodClusts[0:20]
-        print goodClusts
-        print 'Done'
+        #Output the good clusters
+        return outClusts
 
 
 if __name__ == "__main__":
@@ -339,7 +482,7 @@ if __name__ == "__main__":
                         "tableName":'testdots3tz', "tsField":'time_stamp', "geomField":'the_geom'}
                        ],
          'maxClustArea':10.0, 'maxClustTime':3600.0,
-         'pgTableOut':{"host":'localhost', "user":'dusted', "db":'dusted', "passwd":'dusted',
+         'pgTableOut':{"host":'localhost', "user":'dusted', "db":'dusted', "passwd":'dusted', "schema":'public',
                        "tableName":'testClass', "tsField":'time_stamp', "geomField":'the_geom'},
          'runType': 'full'}
     #Run
