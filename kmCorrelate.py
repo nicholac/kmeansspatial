@@ -44,7 +44,7 @@ class kmCorrelate(object):
                        ],
          'maxClustArea':10.0, 'maxClustTime':3600.0,
          'pgTableOut':{"host":'localhost', "user":'dusted', "db":'dusted', "passwd":'dusted', "schema":'public',
-                       "tableName":'testClass', "tsField":'time_stamp', "geomField":'the_geom'},
+                       "tableName":'testClass1'},
          'runType': 'setupcheck'}
         '''
         #Checking for run type
@@ -106,15 +106,23 @@ class kmCorrelate(object):
                 return None
 
             elif params['runType'] == 'full':
+                #Record Starttime
+                startDtg = datetime.now()
                 #Now run the algo
                 vects, infoStore = self.vectorise()
                 clustLabels, clustVecs, clustCents = self.cluster(vects, infoStore)
-                goodClusts = self.reduceClusters(clustLabels, clustVecs, clustCents,
-                                                 params['pgTableOut'], self.xMin, self.yMin, self.xRange, self.yRange)
-                print goodClusts
-                output = self.saveClusterHulls(goodClusts, clustVecs, clustCents, params['pgtableOut'])
-
-                return None
+                goodClusts = self.reduceClusters(clustLabels, clustVecs, clustCents, params['maxClustTime'],
+                                                 params['maxClustArea'], params['pgTableOut'], self.xMin, self.yMin,
+                                                 self.xRange, self.yRange)
+                #print goodClusts
+                output = self.saveClusterHulls(goodClusts, params['pgTableOut'])
+                if output == True:
+                    #Tell run time
+                    runTime =  datetime.now() - startDtg
+                    'Complete, Runtime (mins): '+str(runTime.total_seconds()/60.0)
+                else:
+                    print 'Fatal: Cluster Hull Output Failed'
+                    raise ValueError
             else:
                 #bad run type
                 print 'Fatal: Unknown runtype (use \'unittest\', \'setupcheck\' or \'full\': ' + params['runType']
@@ -123,7 +131,7 @@ class kmCorrelate(object):
 
 
     def testPGOutput(self, pgTableOut):
-        '''Checks for privs to create an output table
+        '''Checks for privs and existance to create an output table
         '''
         try:
             user = pgTableOut['user']
@@ -142,8 +150,25 @@ class kmCorrelate(object):
             print 'Fatal: Connection to output table failed: ' + str(pgTableOut)
             return False
 
-        #Check the Schema Privs for table creation
         cur = pgC.cursor()
+        #Check output exists
+        sql = 'SELECT \''+pgTableOut['schema']+'.'+pgTableOut['tableName']+'\'::regclass'
+        try:
+            cur.execute(sql)
+            print 'Fatal: Output table exists'
+            pgC.close()
+            return False
+        except:
+            #Table doesnt exist - continue
+            pgC.close()
+            pass
+        #Re-open connection because th exception kills it...
+        pgC = self.pgConn(pgTableOut['host'], pgTableOut['db'],
+                          pgTableOut['user'], pgTableOut['passwd'])
+        cur = pgC.cursor()
+
+        #Check the Schema Privs for table creation
+
         sql = 'SELECT * FROM has_schema_privilege(%s, %s, %s)'
         data = (pgTableOut['user'],pgTableOut['schema'], 'CREATE')
         cur.execute(sql, data)
@@ -239,14 +264,14 @@ class kmCorrelate(object):
         inDtgUnix = float(inDtg.strftime('%s'))
         totSecs= dtgToUnix - dtgFromUnix
         #Normalise
-        normDtg = (dtgFromUnix - inDtgUnix)/totSecs
+        normDtg = (inDtgUnix - dtgFromUnix)/totSecs
         return normDtg
 
-    def unNormDtg(self, inDtgUnix, dtgFromUnix, dtgToUnix):
+    def unNormDtg(self, inDtgVec, dtgFromUnix, dtgToUnix):
         '''Convert a normalsied date back to datetime
         '''
         totSecs= dtgToUnix - dtgFromUnix
-        unNormDtg = datetime.fromtimestamp(((inDtgUnix*totSecs)-dtgFromUnix)*-1)
+        unNormDtg = datetime.fromtimestamp((dtgFromUnix+(inDtgVec*totSecs)))
         return unNormDtg
 
     def chkDtgRange(self, clustDtgs, dtgFromUnix, dtgToUnix):
@@ -259,7 +284,7 @@ class kmCorrelate(object):
         fromUnNorm = self.unNormDtg(fromNorm, dtgFromUnix, dtgToUnix)
         toUnNorm = self.unNormDtg(toNorm, dtgFromUnix, dtgToUnix)
         #Get Range
-        dtgRnge = fromUnNorm - toUnNorm
+        dtgRnge = toUnNorm - fromUnNorm
         return dtgRnge.total_seconds(), fromUnNorm, toUnNorm
 
     def geoArea(self, inGeomStr, pgParams):
@@ -307,29 +332,52 @@ class kmCorrelate(object):
             print 'Fatal: Connection to output table failed: ' + str(pgParams)
             raise ValueError
         cur = pgC.cursor()
-        print cur.mogrify(polySql)
         cur.execute(polySql)
         res = cur.fetchall()
         pgC.close()
         return res[0][0]
 
-    def saveClusterHulls(self, goodClusts, clusterVecs, pgTableOut):
+    def saveClusterHulls(self, clusters, pgTableOut):
         '''Dumps reduced clusters to database as convex hulls
-        Input: good cluster index numbers, zipped cluster vectors
+        Input: Cluster array: [geom, area, dtgfrom, dtgto]
         Output: True / False on save to DB
+        'pgTableOut':{"host":'localhost', "user":'dusted', "db":'dusted', "passwd":'dusted', "schema":'public',
+                       "tableName":'testClass'},
         '''
-        #PG connection
+        print 'Running: Dumping Cluster Hulls to DB...'
+        insCnt = 0
+        #PG connection - already checked for table creation...
         try:
             pgC = self.pgConn(pgTableOut['host'], pgTableOut['db'],
                           pgTableOut['user'], pgTableOut['passwd'])
         except:
             print 'Fatal: Connection to output table failed: ' + str(pgTableOut)
             raise ValueError
-        #Work through the good clusters, hulling and saving
-        for idx, pt in enumerate(clusterVecs):
-            #Only take the ones we care about
-            if int(pt[0]) in goodClusts:
-                pass
+        #Create the output table
+        sql = 'CREATE table '+pgTableOut['schema']+'.'+pgTableOut['tableName']+' (oid serial, area double precision, dtgfrom timestamp with time zone, dtgto timestamp with time zone)'
+        cur = pgC.cursor()
+        cur.execute(sql)
+        pgC.commit()
+        #Add geometry field
+        #sql = 'select addgeometrycolumn('+pgTableOut['schema']+','+pgTableOut['tableName']+',\'the_geom\',4326,\'POLYGON\',2)'
+        sql = 'select addgeometrycolumn(%s,%s,\'the_geom\',4326,\'POLYGON\',2)'
+        data = (pgTableOut['schema'], pgTableOut['tableName'])
+        cur.execute(sql, data)
+
+        #Insert the cluster hulls
+        #TODO: catches here for invalid geoms
+        for hull in clusters:
+            #Build sql
+            sql = 'INSERT INTO '+pgTableOut['schema']+'.'+pgTableOut['tableName']+'(the_geom, area, dtgfrom, dtgto) values (%s, %s, %s, %s)'
+            data = (hull[0], hull[1], hull[2], hull[3])
+            cur.execute(sql, data)
+            insCnt+=1
+
+        #Flush
+        pgC.commit()
+        pgC.close()
+        print 'Running: Done Dumping Cluster Hulls: '+str(insCnt)
+        return True
 
     def vectorise(self):
         '''Creates an array of normalised vectors from the input tables
@@ -350,6 +398,7 @@ class kmCorrelate(object):
                 cur = pgC.cursor()
                 #Get all the data over bounding box and time - converting to UTC
                 sql = 'select st_astext(' + table['geomField'] + '), '+ table['tsField'] +' AT TIME ZONE \'UTC\' from '+ table['tableName'] +' where st_contains(st_geomfromtext(\'POLYGON((%s %s, %s %s, %s %s, %s %s, %s %s))\',4326), the_geom) AND '+ table['tsField'] +' AT TIME ZONE \'UTC\' > %s AND '+ table['tsField'] +' AT TIME ZONE \'UTC\' < %s'
+                #sql = 'select st_astext(' + table['geomField'] + '), '+ table['tsField'] +' from '+ table['tableName'] +' where st_contains(st_geomfromtext(\'POLYGON((%s %s, %s %s, %s %s, %s %s, %s %s))\',4326), the_geom) AND '+ table['tsField'] +' > %s AND '+ table['tsField'] +' < %s'
                 data = (self.xMin, self.yMin, self.xMin, self.yMax, self.xMax,
                         self.yMax, self.xMax, self.yMin, self.xMin, self.yMin,
                         self.dtgFrom, self.dtgTo)
@@ -370,45 +419,50 @@ class kmCorrelate(object):
                 #Store the endpoint for this table
                 infoStore.append(len(vects))
             pgC.close()
-
+        print 'Running: # Vectors: '+str(len(vects))
         #Send back the data
-        return vects, infoStore
+        return tuple(vects), tuple(infoStore)
 
     def cluster(self, vects, infoStore):
         '''Runs the KM Clustering Algorithm
+        Input: vects is python array of [x,y,z] triples
+        Infostore is python array with ints showing location where datasets stop within array
         '''
-        print 'Running: Running KMeans...'
-        #Run through kmeans
-        inVecs = np.array(vects)
-        del vects
-        stop_it = False
-        n_clusters = 5
-        firstone = True
-        while stop_it == False:
-            initKmeans = KMeans(init='k-means++', max_iter=1000, n_clusters=n_clusters, n_init=5)
-            #Do the clustering
-            kmClust = initKmeans.fit(inVecs)
-            if firstone == True:
-                cluster_inertia = np.array([[n_clusters,kmClust.inertia_]])
-                firstone = False
-            else:
-                cluster_inertia=np.vstack((cluster_inertia,[n_clusters,kmClust.inertia_]))
-            if len(cluster_inertia) > 5:
-                gradient = (cluster_inertia[-2:,1][0]-cluster_inertia[-1:,1])[0]
-                #Tunable gradient for cluster fitting
-                if gradient < 0.002:
-                    stop_it = True
-            n_clusters += 1
-        print 'Running: Completed KMeans with # clusters: '+ str(n_clusters)
+        try:
+            print 'Running: Running KMeans...'
+            #Run through kmeans
+            inVecs = np.array(vects)
+            del vects
+            stop_it = False
+            n_clusters = 5
+            firstone = True
+            while stop_it == False:
+                initKmeans = KMeans(init='k-means++', max_iter=1000, n_clusters=n_clusters, n_init=5)
+                #Do the clustering
+                kmClust = initKmeans.fit(inVecs)
+                if firstone == True:
+                    cluster_inertia = np.array([[n_clusters,kmClust.inertia_]])
+                    firstone = False
+                else:
+                    cluster_inertia=np.vstack((cluster_inertia,[n_clusters,kmClust.inertia_]))
+                if len(cluster_inertia) > 5:
+                    gradient = (cluster_inertia[-2:,1][0]-cluster_inertia[-1:,1])[0]
+                    #Tunable gradient for cluster fitting
+                    if gradient < 0.00002:
+                        stop_it = True
+                n_clusters += 1
+            print 'Running: Completed KMeans with # clusters: '+ str(n_clusters)
 
-        print 'Running: Dumping Clusters...'
-        #Dump out clusters
-        outCenters = kmClust.cluster_centers_
-        kmLabels = kmClust.labels_
-        #Zip up the cluster labels and vectors
-        #zipped = zip(kmLabels, inVecs)
+            print 'Running: Dumping Clusters...'
+            #Dump out clusters
+            outCenters = kmClust.cluster_centers_
+            kmLabels = kmClust.labels_
+            return kmLabels, inVecs, outCenters
 
-        return kmLabels, inVecs, outCenters
+        #Some Kmeans failure
+        except Exception, err:
+            print 'Fatal: KMeans Failed: '+sys.exc_info()[0]
+            raise ValueError
 
     def clusterDists(self, clusterVecs, clustCent):
         '''Calculates the average distance between centroid and clusters vectors
@@ -430,7 +484,8 @@ class kmCorrelate(object):
         dSpat = 0.0
         return avgDist, avgSpatDist
 
-    def reduceClusters(self, clustLabels, clustVecs, clustCents, pgParams, xMin, yMin, xRange, yRange):
+    def reduceClusters(self, clustLabels, clustVecs, clustCents, maxClustTime,
+                        maxClustArea, pgParams, xMin, yMin, xRange, yRange):
         '''Take the KMeans clustering output and picks the clusters for export
         Output array containing arrays for each good cluster: x,y,z, spatDist, timeDist:
         [[x,y,z], [x,y,z], ...],spatDist, timeDist]
@@ -440,25 +495,44 @@ class kmCorrelate(object):
         clustDtgs = []
         outClusts = []
         #Zip lists together
+        print set(clustLabels)
         vecZip = zip(clustVecs, clustLabels)
-        #Loop through clusters
-        for lbl in clustLabels:
+        #Loop through clusters - as a set of unique cluster labels
+        i = 0
+        for lbl in set(clustLabels):
+            i+=1
             #Build Cluster array
             clustPts = [(vec[0][0], vec[0][1]) for vec in vecZip if vec[1]==lbl]
             clustDtgs = [vec[0][2] for vec in vecZip if vec[1]==lbl]
+            #Check Length
+            if len(clustPts) < 2:
+                #Clean up and move on
+                print 'Skipped Cluster: '+str(lbl)
+                clustPts = []
+                clustDtgs = []
+                continue
             #Check DTG first - total range in seconds
             clustSecs, clustDtgfrom, clustDtgTo = self.chkDtgRange(clustDtgs, self.unixDtgFrom, self.unixDtgTo)
-            print 'time:'+str(clustSecs)
-            if clustSecs < params['maxClustTime']:
+
+            ##Testing Delete--------------------------
+            #Calculate area of this cluster
+            geomStr = self.convexHullCluster(clustPts, pgParams, xMin, yMin, xRange, yRange)
+            #Area in Sq Metres
+            geoArea = self.geoArea(geomStr, pgParams)
+            outClusts.append((geomStr, geoArea, clustDtgfrom, clustDtgTo))
+            ##Testing Delete--------------------------
+            '''
+            if clustSecs <= maxClustTime:
                 #Calculate area of this cluster
                 geomStr = self.convexHullCluster(clustPts, pgParams, xMin, yMin, xRange, yRange)
                 #Area in Sq Metres
                 geoArea = self.geoArea(geomStr, pgParams)
                 print 'Area:'+str(geoArea)
                 #Check if its within input area tolerance
-                if geoArea <= params['maxClustArea']:
+                if geoArea <= maxClustArea:
                     #Good cluster - store
-                    outClusts.append((clustPts, geoArea, clustDtgfrom, clustDtgTo))
+                    #TODO: Output the points here aswell if extended in future
+                    outClusts.append((geomStr, geoArea, clustDtgfrom, clustDtgTo))
                 else:
                     #Clean up and move on
                     clustPts = []
@@ -467,23 +541,24 @@ class kmCorrelate(object):
                 #Clean up and move on
                 clustPts = []
                 clustDtgs = []
-
+            '''
         #Output the good clusters
+        print 'Number clusters: '+str(i)
         return outClusts
 
 
 if __name__ == "__main__":
 
-    params = {'xMin':-9.4921875, 'yMin':38.272688, 'xMax':14.150390, 'yMax':50.73645,
-         'dtgFrom':'2012-01-12T11:58:26', 'dtgTo':'2016-02-12T11:58:26',
+    params = {'xMin':40.0, 'yMin':40.0, 'xMax':70.0, 'yMax':70.0,
+         'dtgFrom':'2013-01-12T11:58:26', 'dtgTo':'2021-02-12T11:58:26',
          'pgTablesIn':[{"host":'localhost', "user":'dusted', "db":'dusted', "passwd":'dusted',
-                        "tableName":'testdots2tz', "tsField":'time_stamp', "geomField":'the_geom'},
+                        "tableName":'testdots3tz', "tsField":'time_stamp', "geomField":'the_geom'},
                        {"host":'localhost', "user":'dusted', "db":'dusted', "passwd":'dusted',
-                        "tableName":'testdots3tz', "tsField":'time_stamp', "geomField":'the_geom'}
+                        "tableName":'testdots2tz', "tsField":'time_stamp', "geomField":'the_geom'}
                        ],
-         'maxClustArea':10.0, 'maxClustTime':3600.0,
+         'maxClustArea':10000.0, 'maxClustTime':36000.0,
          'pgTableOut':{"host":'localhost', "user":'dusted', "db":'dusted', "passwd":'dusted', "schema":'public',
-                       "tableName":'testClass', "tsField":'time_stamp', "geomField":'the_geom'},
+                       "tableName":'testclass12'},
          'runType': 'full'}
     #Run
     kmCorrelate(params)

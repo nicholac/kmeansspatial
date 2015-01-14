@@ -42,9 +42,9 @@ class Test(unittest.TestCase):
 
     def testNormUnnormDates(self):
         unixFrom, unixTo = self.kmCorr.unixDtgBounds(datetime(2013, 1, 1, 1, 1, 1, 0), datetime(2013, 1, 1, 1, 3, 1, 0))
-        unixDtg = self.kmCorr.normDtg(datetime(2013, 1, 1, 1, 1, 2, 0), unixFrom, unixTo)
-        outUnNorm = self.kmCorr.unNormDtg(unixDtg, unixFrom, unixTo)
-        self.assertEqual(outUnNorm, datetime(2013, 1, 1, 1, 1, 2, 0))
+        vecDtg = self.kmCorr.normDtg(datetime(2013, 1, 1, 1, 2, 1, 0), unixFrom, unixTo)
+        outUnNorm = self.kmCorr.unNormDtg(vecDtg, unixFrom, unixTo)
+        self.assertEqual(outUnNorm, datetime(2013, 1, 1, 1, 2, 1, 0))
 
     def testNormCoords(self):
         #Crossing all meridians
@@ -113,10 +113,20 @@ class Test(unittest.TestCase):
         for dtg in inDtg:
             normDtg.append(self.kmCorr.normDtg(dtg, unixDtgFrom, unixDtgTo))
         self.assertEqual(self.kmCorr.chkDtgRange(normDtg, unixDtgFrom, unixDtgTo),
-                         (180.0, datetime(2014, 10, 14, 12, 17, 31), datetime(2014, 10, 14, 12, 14, 31)))
+                         (180.0, datetime(2014, 10, 14, 12, 14, 31), datetime(2014, 10, 14, 12, 17, 31)))
+
+    def testSaveHull(self):
+        '''Check output format of cluster
+        '''
+        pass
 
     def testReduceClusters(self):
         '''Testing cluster reduction based on input and output params
+        '''
+        pass
+
+    def testCluster(self):
+        '''This is difficult as the K++ init will create differing numbers of clusters
         '''
         pass
 
