@@ -1,22 +1,24 @@
 '''
 Created on 12 Jan 2015
 
-@author: dusted
+@author: Chris Nicholas
 
-TODO: Make portability easier with conenction params for PG
+Unit Tests for kmCorrelate
 
 '''
 import unittest
 from datetime import datetime
-#from kmeans import normCoords, unNormCoords, coordRange, unixDtgBounds, normDtg, unNormDtg
 from kmCorrelate import kmCorrelate
+import os, json
 
 class Test(unittest.TestCase):
 
     def setUp(self):
         self.kmCorr = kmCorrelate({'runType':'unittest'})
-        self.pgParams = {"host":'localhost', "user":'dusted', "db":'dusted', "passwd":'dusted',
-                        "tableName":'testdots2tz', "tsField":'time_stamp', "geomField":'the_geom'}
+        fh = open(os.path.dirname(os.path.realpath(__file__))+'/kmTestParams.txt','r')
+        self.pgParams = fh.read()
+        fh.close()
+        self.pgParams = json.loads(self.pgParams)
 
     def tearDown(self):
         pass

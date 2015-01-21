@@ -1,7 +1,18 @@
+#!/usr/local/bin/python2.7
+# encoding: utf-8
 '''
 Created on 12 Jan 2015
 
-@author: dusted
+KMeans Correlate Command-Line Class
+
+@author:     Nicholas C
+
+@copyright:  2015 Dstl. All rights reserved.
+
+@license:    TBD
+
+@contact:    cnicholac1@dstl.gov.uk
+@deffield    updated: 21-01-2015
 
 Supports:
 - PG tables only with timezone (converts all to UTC for vectorisation)
@@ -102,7 +113,7 @@ class kmCorrelate(object):
 
             #If we are just checking setup we've passed init - return
             if params['runType'] == 'setupcheck':
-                print 'Success: Params look good: '+ str(params)
+                print 'Success: Params look good: \n'+ str(params)
                 return None
 
             elif params['runType'] == 'full':
@@ -184,41 +195,45 @@ class kmCorrelate(object):
         '''Tests all the given pg tables for appropriateness for running
         Returns False if setup is bad
         '''
-        f = True
-        #Check the PG Input tables
-        for table in pgTables:
-            pgC = self.pgConn(table['host'], table['db'], table['user'], table['passwd'])
-            if not pgC:
-                print 'Fatal: Connection failed to input table: ' + str(table)
-                f = False
-                continue
-            else:
-                #Run a test select
-                sql = 'SELECT ' + table['tsField'] +', ' + table['geomField'] + ' from '+ table['tableName'] +' limit 1'
-                cur = pgC.cursor()
-                cur.execute(sql)
-                res = cur.fetchall()
-                if not res:
-                    print 'Fatal: No data found with given field names in table: ' + str(table)
+        try:
+            f = True
+            #Check the PG Input tables
+            for table in pgTables:
+                pgC = self.pgConn(table['host'], table['db'], table['user'], table['passwd'])
+                if not pgC:
+                    print 'Fatal: Connection failed to input table: ' + str(table)
                     f = False
-                    pgC.close()
-                    continue
-                #Check geom type
-                sql = 'SELECT GeometryType('+ table['geomField'] +') as result FROM (SELECT ' + table['geomField'] + ' from '+ table['tableName'] +' limit 1) as g;'
-                cur = pgC.cursor()
-                cur.execute(sql)
-                res = cur.fetchall()
-                if res[0][0] != 'POINT':
-                    print 'Fatal: Table has wrong geometry type: ' + str(table)
-                    f = False
-                    pgC.close()
                     continue
                 else:
-                    #Good, just close conn
-                    pgC.close()
+                    #Run a test select
+                    sql = 'SELECT ' + table['tsField'] +', ' + table['geomField'] + ' from '+ table['tableName'] +' limit 1'
+                    cur = pgC.cursor()
+                    cur.execute(sql)
+                    res = cur.fetchall()
+                    if not res:
+                        print 'Fatal: No data found with given field names in table: ' + str(table)
+                        f = False
+                        pgC.close()
+                        continue
+                    #Check geom type
+                    sql = 'SELECT GeometryType('+ table['geomField'] +') as result FROM (SELECT ' + table['geomField'] + ' from '+ table['tableName'] +' limit 1) as g;'
+                    cur = pgC.cursor()
+                    cur.execute(sql)
+                    res = cur.fetchall()
+                    if res[0][0] != 'POINT':
+                        print 'Fatal: Table has wrong geometry type: ' + str(table)
+                        f = False
+                        pgC.close()
+                        continue
+                    else:
+                        #Good, just close conn
+                        pgC.close()
 
-        #Success if here:
-        return f
+            #Success if here:
+            return f
+        except Exception as e:
+            print 'Fatal: KMeans Failed: '+str(e)
+            return False
 
     def pgConn(self, host, db, user, passwd):
         '''Connect to a PG database
@@ -453,15 +468,14 @@ class kmCorrelate(object):
                 n_clusters += 1
             print 'Running: Completed KMeans with # clusters: '+ str(n_clusters)
 
-            print 'Running: Dumping Clusters...'
             #Dump out clusters
             outCenters = kmClust.cluster_centers_
             kmLabels = kmClust.labels_
             return kmLabels, inVecs, outCenters
 
         #Some Kmeans failure
-        except Exception, err:
-            print 'Fatal: KMeans Failed: '+sys.exc_info()[0]
+        except Exception as e:
+            print 'Fatal: KMeans Failed: '+str(e)
             raise ValueError
 
     def clusterDists(self, clusterVecs, clustCent):
@@ -495,73 +509,59 @@ class kmCorrelate(object):
         clustDtgs = []
         outClusts = []
         #Zip lists together
-        print set(clustLabels)
         vecZip = zip(clustVecs, clustLabels)
         #Loop through clusters - as a set of unique cluster labels
         i = 0
         for lbl in set(clustLabels):
-            i+=1
             #Build Cluster array
             clustPts = [(vec[0][0], vec[0][1]) for vec in vecZip if vec[1]==lbl]
             clustDtgs = [vec[0][2] for vec in vecZip if vec[1]==lbl]
             #Check Length
             if len(clustPts) < 2:
                 #Clean up and move on
-                print 'Skipped Cluster: '+str(lbl)
+                print 'Running: Skipped Cluster: '+str(lbl)
                 clustPts = []
                 clustDtgs = []
                 continue
             #Check DTG first - total range in seconds
             clustSecs, clustDtgfrom, clustDtgTo = self.chkDtgRange(clustDtgs, self.unixDtgFrom, self.unixDtgTo)
 
-            ##Testing Delete--------------------------
-            #Calculate area of this cluster
-            geomStr = self.convexHullCluster(clustPts, pgParams, xMin, yMin, xRange, yRange)
-            #Area in Sq Metres
-            geoArea = self.geoArea(geomStr, pgParams)
-            outClusts.append((geomStr, geoArea, clustDtgfrom, clustDtgTo))
-            ##Testing Delete--------------------------
-            '''
-            if clustSecs <= maxClustTime:
+            if maxClustTime == 0 or maxClustArea == 0:
+                #Just dump all the clusters
                 #Calculate area of this cluster
                 geomStr = self.convexHullCluster(clustPts, pgParams, xMin, yMin, xRange, yRange)
                 #Area in Sq Metres
                 geoArea = self.geoArea(geomStr, pgParams)
-                print 'Area:'+str(geoArea)
-                #Check if its within input area tolerance
-                if geoArea <= maxClustArea:
-                    #Good cluster - store
-                    #TODO: Output the points here aswell if extended in future
-                    outClusts.append((geomStr, geoArea, clustDtgfrom, clustDtgTo))
+                outClusts.append((geomStr, geoArea, clustDtgfrom, clustDtgTo))
+
+            else:
+                #Select the ones within input params
+                if clustSecs <= maxClustTime:
+                    #Calculate area of this cluster
+                    geomStr = self.convexHullCluster(clustPts, pgParams, xMin, yMin, xRange, yRange)
+                    #Area in Sq Metres
+                    geoArea = self.geoArea(geomStr, pgParams)
+                    #print 'Area:'+str(geoArea)
+                    #Check if its within input area tolerance
+                    if geoArea <= maxClustArea:
+                        #Good cluster - store
+                        #TODO: Output the points here aswell if extended in future
+                        outClusts.append((geomStr, geoArea, clustDtgfrom, clustDtgTo))
+                    else:
+                        #Clean up and move on
+                        clustPts = []
+                        clustDtgs = []
                 else:
                     #Clean up and move on
                     clustPts = []
                     clustDtgs = []
-            else:
-                #Clean up and move on
-                clustPts = []
-                clustDtgs = []
-            '''
+
         #Output the good clusters
-        print 'Number clusters: '+str(i)
+        print 'Running: # clusters within input tolerance: '+str(len(outClusts))
         return outClusts
 
-
 if __name__ == "__main__":
-
-    params = {'xMin':40.0, 'yMin':40.0, 'xMax':70.0, 'yMax':70.0,
-         'dtgFrom':'2013-01-12T11:58:26', 'dtgTo':'2021-02-12T11:58:26',
-         'pgTablesIn':[{"host":'localhost', "user":'dusted', "db":'dusted', "passwd":'dusted',
-                        "tableName":'testdots3tz', "tsField":'time_stamp', "geomField":'the_geom'},
-                       {"host":'localhost', "user":'dusted', "db":'dusted', "passwd":'dusted',
-                        "tableName":'testdots2tz', "tsField":'time_stamp', "geomField":'the_geom'}
-                       ],
-         'maxClustArea':10000.0, 'maxClustTime':36000.0,
-         'pgTableOut':{"host":'localhost', "user":'dusted', "db":'dusted', "passwd":'dusted', "schema":'public',
-                       "tableName":'testclass12'},
-         'runType': 'full'}
-    #Run
-    kmCorrelate(params)
+    pass
 
 
 

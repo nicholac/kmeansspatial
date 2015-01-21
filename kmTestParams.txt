@@ -1,0 +1,1 @@
+{"host":"host","user":"user","db":"db","passwd":"password","tableName":"testdots2tz","tsField":"time_stamp","geomField":"the_geom"}
